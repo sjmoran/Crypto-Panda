@@ -50,9 +50,9 @@ HIGH_VOLATILITY_THRESHOLD = 0.05  # 5% volatility is considered high
 MEDIUM_VOLATILITY_THRESHOLD = 0.02  # 2% volatility is considered medium
 
 # Flag to test with just Bitcoin
-TEST_ONLY = True  # Set to False to monitor all coins
-MAX_RETRIES = 5  # Maximum number of retries for API calls
-BACKOFF_FACTOR = 3  # Factor by which the wait time increases after each failure
+TEST_ONLY = False  # Set to False to monitor all coins
+MAX_RETRIES = 2  # Maximum number of retries for API calls
+BACKOFF_FACTOR = 2  # Factor by which the wait time increases after each failure
 
 def api_call_with_retries(api_function, *args, **kwargs):
     """
@@ -70,7 +70,7 @@ def api_call_with_retries(api_function, *args, **kwargs):
         Exception: If the API function call fails after MAX_RETRIES retries.
     """
     retries = 0
-    wait_time = 1  # Initial wait time (seconds)
+    wait_time = 60  # Initial wait time (seconds)
     time.sleep(5)
 
     while retries < MAX_RETRIES:
@@ -878,7 +878,6 @@ def monitor_coins_and_send_report():
     # Fetch Trending Coins data once
     trending_coins_scores = fetch_trending_coins_scores()  # Assume this function processes and returns a dictionary of scores
 
-    # Process each coin
     for coin in coins_to_monitor:
         try:
             coin_id = coin['id']
@@ -911,7 +910,9 @@ def monitor_coins_and_send_report():
         except Exception as e:
             # Log the error, but continue with the next coin
             logging.debug(f"An error occurred while processing {coin_name} ({coin_id}): {e}")
-            traceback.logging.debug_exc()
+            logging.debug(traceback.format_exc())  # Correct way to log the full traceback
+            continue
+
 
     # Ensure all cumulative_score values are numeric (default to 0 if None)
     for entry in report_entries:
