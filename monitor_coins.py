@@ -17,6 +17,24 @@ import re
 import math
 import os
 import logging 
+from fuzzywuzzy import fuzz
+from fuzzywuzzy import process
+
+surge_words = [
+    "surge", "spike", "soar", "rocket", "skyrocket", "rally", "boom", "bullish", 
+    "explosion", "rise", "uptrend", "bull run", "moon", "parabolic", "spurt", 
+    "climb", "jump", "upswing", "gain", "increase", "growth", "rebound", 
+    "breakout", "spurt", "pump", "fly", "explode", "shoot up", "hike", 
+    "expand", "appreciate", "bull market", "peak", "momentum", "outperform", 
+    "spike up", "ascend", "elevation", "expansion", "revive", "uprising", 
+    "push up", "escalate", "rise sharply", "escalation", "recover", 
+    "inflation", "strengthen", "gain strength", "intensify"
+]
+
+# Volume thresholds for liquidity risk
+LOW_VOLUME_THRESHOLD_LARGE = 1_000_000  # Large-cap coins with daily volume under $1M
+LOW_VOLUME_THRESHOLD_MID = 500_000  # Mid-cap coins with daily volume under $500k
+LOW_VOLUME_THRESHOLD_SMALL = 100_000  # Small-cap coins with daily volume under $100k
 
 # Configure logging
 logging.basicConfig(
@@ -138,16 +156,24 @@ def fetch_historical_ticker_data(coin_id, start_date, end_date):
         return pd.DataFrame()
 
         
-surge_words = [
-    "surge", "spike", "soar", "rocket", "skyrocket", "rally", "boom", "bullish", 
-    "explosion", "rise", "uptrend", "bull run", "moon", "parabolic", "spurt", 
-    "climb", "jump", "upswing", "gain", "increase", "growth", "rebound", 
-    "breakout", "spurt", "pump", "fly", "explode", "shoot up", "hike", 
-    "expand", "appreciate", "bull market", "peak", "momentum", "outperform", 
-    "spike up", "ascend", "elevation", "expansion", "revive", "uprising", 
-    "push up", "escalate", "rise sharply", "escalation", "recover", 
-    "inflation", "strengthen", "gain strength", "intensify"
-]
+def filter_active_and_ranked_coins(coins, max_coins, rank_threshold=1000):
+    """
+    Filters the list of coins by rank, activity status, and new status, selecting up to max_coins.
+
+    Parameters:
+        coins (list): List of coins with rank, activity status, and new status information.
+        max_coins (int): The maximum number of coins to return.
+        rank_threshold (int): The maximum rank a coin must have to be included (e.g., rank <= 1000).
+
+    Returns:
+        list: Filtered list of coins that are active, not new, and ranked within the rank_threshold.
+    """
+    # Filter out coins that are not active, are new, or have a rank above the rank_threshold
+    active_ranked_coins = [coin for coin in coins if coin.get('is_active', False) and not coin.get('is_new', True) and coin.get('rank', None) <= rank_threshold]
+
+    # Limit the list to max_coins
+    return active_ranked_coins[:max_coins]
+
 
 def fetch_coin_events(coin_id):
     """
@@ -431,9 +457,6 @@ def compute_sentiment_for_coin(coin_name, news_data):
     # Return 1 if the average sentiment is very positive (e.g., greater than 0.5), otherwise return 0
     return 1 if average_sentiment > 0.5 else 0
 
-from fuzzywuzzy import fuzz
-from fuzzywuzzy import process
-
 def score_surge_words(news_df, surge_words):
     """
     Analyze news articles and score the presence of surge words.
@@ -502,7 +525,41 @@ def get_fuzzy_trending_score(coin_id, coin_name, trending_coins_scores):
             max_score = max(max_score, score)
     return max_score
 
-def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores):   
+
+def classify_liquidity_risk(volume_24h, market_cap_class):
+    """
+    Classify liquidity risk based on trading volume.
+
+    Parameters:
+        volume_24h (float): The 24-hour trading volume of the cryptocurrency.
+        market_cap_class (str): The market capitalization class, one of "Large", "Mid", or "Small".
+
+    Returns:
+        str: The classification of liquidity risk ('Low', 'Medium', 'High').
+    """
+    if market_cap_class == "Large":
+        if volume_24h < LOW_VOLUME_THRESHOLD_LARGE:
+            return "High"
+        elif volume_24h < LOW_VOLUME_THRESHOLD_LARGE * 2:
+            return "Medium"
+        else:
+            return "Low"
+    elif market_cap_class == "Mid":
+        if volume_24h < LOW_VOLUME_THRESHOLD_MID:
+            return "High"
+        elif volume_24h < LOW_VOLUME_THRESHOLD_MID * 2:
+            return "Medium"
+        else:
+            return "Low"
+    else:  # Small market cap
+        if volume_24h < LOW_VOLUME_THRESHOLD_SMALL:
+            return "High"
+        elif volume_24h < LOW_VOLUME_THRESHOLD_SMALL * 2:
+            return "Medium"
+        else:
+            return "Low"
+
+def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores):
     """
     Analyzes a given cryptocurrency and returns a dictionary with various analysis scores, 
     including a score for whether the coin appears in the Sundown Digest and trending coins list.
@@ -557,6 +614,13 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
     recent_events_count = sum(1 for event in events if datetime.strptime(event['date'], '%Y-%m-%d') <= datetime.now())
     event_score = 1 if recent_events_count > 0 else 0
 
+    # Classify market cap
+    market_cap_class = classify_market_cap(historical_df_long_term['market_cap'].iloc[-1])
+
+    # Calculate liquidity risk based on the most recent 24-hour volume
+    most_recent_volume_24h = historical_df_long_term['volume_24h'].iloc[-1]
+    liquidity_risk = classify_liquidity_risk(most_recent_volume_24h, market_cap_class)
+
     # Integrate sentiment analysis
     if not news_df.empty:
         coin_news = news_df[news_df['coin'] == coin_name]
@@ -589,6 +653,7 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
 
     # Build the explanation string, including the detailed price change and surge word explanation
     explanation = f"{coin_name} ({coin_id}) analysis: "
+    explanation += f"Liquidity Risk: {liquidity_risk}, "
     explanation += f"Price Change Score: {'Significant' if price_change_score else 'No significant change'} ({price_change_explanation}), "
     explanation += f"Volume Change Score: {'Significant' if volume_score else 'No significant change'} ({volume_explanation}), "
     explanation += f"Tweets: {'Yes' if tweet_score else 'None'}, "
@@ -616,6 +681,7 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
         "surging_keywords_score": surge_score,
         "news_digest_score": digest_score,
         "trending_score": trending_score,
+        "liquidity_risk": liquidity_risk,  # Added liquidity risk
         "cumulative_score": cumulative_score,
         "cumulative_score_percentage": round(cumulative_score_percentage, 2),  # Rounded to 2 decimal places
         "explanation": explanation
@@ -822,14 +888,12 @@ def monitor_coins_and_send_report():
     If TEST_ONLY is set to True, only a few coins are processed and the results are
     saved to a file. Otherwise, all coins are processed and the results are sent
     via email.
-
-    :return: None
     """
     if TEST_ONLY:
-        existing_results = pd.DataFrame([])
-        coins_to_monitor = api_call_with_retries(client.coins)
 
-        # Add a mix of 10 coins including Bitcoin to monitor
+        # Test only mode: we only process a predefined list of coins
+        existing_results = pd.DataFrame([])
+        # A predefined list of 10-20 coins to monitor for testing purposes
         coins_to_monitor = [
             # Large Cap Cryptocurrencies
             {"id": "nmr-numeraire", "name": "Numeraire"},
@@ -859,10 +923,21 @@ def monitor_coins_and_send_report():
             {"id": "storj-storj", "name": "Storj"},
         ]
 
-
     else:
+        # Normal mode: retrieve coins from CoinPaprika API
         existing_results = load_existing_results()
         coins_to_monitor = api_call_with_retries(client.coins)
+
+        # Report the number of coins retrieved
+        num_coins_retrieved = len(coins_to_monitor)
+        logging.debug(f"Number of coins retrieved: {num_coins_retrieved}")
+        print(f"Number of coins retrieved: {num_coins_retrieved}")
+
+        # Filter coins based on rank and active status, limit to 1000 coins
+        coins_to_monitor = filter_active_and_ranked_coins(coins_to_monitor, 71909)
+
+    logging.debug(f"Number of active and ranked coins selected: {len(coins_to_monitor)}")
+    print(f"Number of active and ranked coins selected: {len(coins_to_monitor)}")
 
     end_date = datetime.now().strftime('%Y-%m-%d')
 
@@ -876,7 +951,7 @@ def monitor_coins_and_send_report():
     digest_tickers = digest_summary['tickers']
 
     # Fetch Trending Coins data once
-    trending_coins_scores = fetch_trending_coins_scores()  # Assume this function processes and returns a dictionary of scores
+    trending_coins_scores = fetch_trending_coins_scores()
 
     for coin in coins_to_monitor:
         try:
@@ -887,20 +962,13 @@ def monitor_coins_and_send_report():
                 logging.debug(f"Skipping already processed coin: {coin_id}")
                 continue
 
-            # Use the tickers to get the right coin ID
-            coins_dict = {coin_name: tickers_dict.get(coin_name, '').upper()}
-
             # Fetch news directly for analysis
+            coins_dict = {coin_name: tickers_dict.get(coin_name, '').upper()}
             news_df = fetch_news_for_past_week(coins_dict)
 
             # Analyze coin and save the result
             result = analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores)
-            logging.debug(f"Result for {coin_name}: {result}")  # Debugging logging.debug
-
-            # Ensure 'cumulative_score' is present
-            if 'cumulative_score' not in result:
-                logging.debug(f"Warning: 'cumulative_score' not found for {coin_name}")
-                result['cumulative_score'] = 0  # Default to 0 if missing
+            logging.debug(f"Result for {coin_name}: {result}")
 
             save_result_to_csv(result)
             report_entries.append(result)
@@ -908,11 +976,11 @@ def monitor_coins_and_send_report():
             time.sleep(20)
 
         except Exception as e:
-            # Log the error, but continue with the next coin
             logging.debug(f"An error occurred while processing {coin_name} ({coin_id}): {e}")
-            logging.debug(traceback.format_exc())  # Correct way to log the full traceback
+            logging.debug(traceback.format_exc())
             continue
 
+    # Final report generation...
 
     # Ensure all cumulative_score values are numeric (default to 0 if None)
     for entry in report_entries:
