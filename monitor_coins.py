@@ -19,6 +19,13 @@ import os
 import logging 
 from fuzzywuzzy import fuzz
 from fuzzywuzzy import process
+import san
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+# Initialize Sanpy API key
+SAN_API_KEY = os.getenv('SAN_API_KEY')
+san.ApiConfig.api_key = SAN_API_KEY
 
 surge_words = [
     "surge", "spike", "soar", "rocket", "skyrocket", "rally", "boom", "bullish", 
@@ -71,6 +78,8 @@ MEDIUM_VOLATILITY_THRESHOLD = 0.02  # 2% volatility is considered medium
 TEST_ONLY = False  # Set to False to monitor all coins
 MAX_RETRIES = 2  # Maximum number of retries for API calls
 BACKOFF_FACTOR = 2  # Factor by which the wait time increases after each failure
+
+CUMULATIVE_SCORE_REPORTING_THRESHOLD=30 # Only report results with cumulative score above this % value
 
 def api_call_with_retries(api_function, *args, **kwargs):
     """
@@ -401,6 +410,53 @@ def has_consistent_weekly_growth(historical_df):
     # Consider consistent growth if at least 4 out of 7 days were rising
     return rising_days >= 4
 
+def fetch_santiment_slugs():
+    """
+    Fetch the available slugs from Santiment using the sanpy API.
+
+    Returns:
+        pd.DataFrame: DataFrame containing Santiment slugs and project information.
+    """
+    try:
+        # Fetch available slugs using sanpy API
+        all_projects = san.get(
+            "projects/all",
+            interval="1d",
+            columns=["slug", "name", "ticker", "infrastructure", "mainContractAddress"]
+        )
+        projects_df = pd.DataFrame(all_projects)
+
+        # Normalize the coin names for matching
+        projects_df['name_normalized'] = projects_df['name'].apply(lambda x: re.sub(r'\W+', '', x.lower()))
+
+        logging.info(f"Fetched {len(projects_df)} Santiment slugs")
+        return projects_df
+
+    except Exception as e:
+        logging.error(f"Error fetching Santiment slugs: {e}")
+        return pd.DataFrame()  # Return empty DataFrame on error
+
+
+
+def match_coins_with_santiment(coin_name, santiment_slugs_df):
+    """
+    Matches a given coin name with the Santiment slugs dataframe.
+    
+    Parameters:
+    coin_name (str): The name of the coin to match.
+    santiment_slugs_df (pd.DataFrame): The dataframe containing Santiment slugs and normalized names.
+    
+    Returns:
+    str: The Santiment slug if a match is found, else None.
+    """    
+    # Look for exact matches in the normalized names
+    match = santiment_slugs_df[santiment_slugs_df['name_normalized'] == coin_name]
+    
+    if not match.empty:
+        return match['slug'].values[0]  # Return the first matching slug
+    return None
+
+
 def has_sustained_volume_growth(historical_df):
     # Calculate daily volume changes
     """
@@ -558,8 +614,53 @@ def classify_liquidity_risk(volume_24h, market_cap_class):
             return "Medium"
         else:
             return "Low"
+def compute_santiment_score_with_thresholds(santiment_data):
+    """
+    Computes a binary score using Santiment data by applying thresholds for each metric and provides explanations for each score.
 
-def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores):
+    Parameters:
+        santiment_data (dict): A dictionary with Santiment metrics data.
+
+    Returns:
+        tuple: A final score based on whether each metric exceeds its threshold and an explanation detailing the scoring.
+    """
+    # Define thresholds for each metric (binary scoring: 0 or 1)
+    thresholds = {
+        'dev_activity': 10,             # Development activity increase must be greater than 10%
+        'daily_active_addresses': 5,    # Daily active addresses increase must be greater than 5%
+    }
+
+    # Extract metric values, defaulting to 0 if not available
+    dev_activity = santiment_data.get('dev_activity_increase', 0)
+    daily_active_addresses = santiment_data.get('daily_active_addresses_increase', 0)
+
+    # Apply thresholds to compute binary scores (0 or 1) and explanations
+    explanations = []
+ 
+    if dev_activity > thresholds['dev_activity']:
+        dev_activity_score = 1
+        explanations.append(f"Development activity increase is significant: {dev_activity}% (Threshold: {thresholds['dev_activity']}%)")
+    else:
+        dev_activity_score = 0
+        explanations.append(f"Development activity increase is low: {dev_activity}% (Threshold: {thresholds['dev_activity']}%)")
+
+    if daily_active_addresses > thresholds['daily_active_addresses']:
+        daily_active_addresses_score = 1
+        explanations.append(f"Daily active addresses show growth: {daily_active_addresses}% (Threshold: {thresholds['daily_active_addresses']}%)")
+    else:
+        daily_active_addresses_score = 0
+        explanations.append(f"Daily active addresses growth is weak: {daily_active_addresses}% (Threshold: {thresholds['daily_active_addresses']}%)")
+    
+    # Sum up the scores to get a total score
+    total_santiment_score = (
+        dev_activity_score +
+        daily_active_addresses_score )
+
+    explanation = " | ".join(explanations)  # Combine explanations into a single string
+
+    return total_santiment_score, explanation
+
+def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores, santiment_slugs_df):
     """
     Analyzes a given cryptocurrency and returns a dictionary with various analysis scores, 
     including a score for whether the coin appears in the Sundown Digest and trending coins list.
@@ -571,9 +672,10 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
         news_df (pd.DataFrame): A DataFrame containing news articles related to the cryptocurrency.
         digest_tickers (list): A list of tickers extracted from the Sundown Digest.
         trending_coins_scores (dict): A dictionary with tickers as keys and their respective scores.
+        santiment_slugs_df (pd.DataFrame): DataFrame containing Santiment slugs for various coins.
 
     Returns:
-        dict: A dictionary with the analysis scores, cumulative score, and detailed explanation.
+        dict: A dictionary with the analysis scores, cumulative score, market cap, volume, and detailed explanation.
     """
     short_term_window = 7
     medium_term_window = 30
@@ -587,6 +689,15 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
     historical_df_medium_term = fetch_historical_ticker_data(coin_id, start_date_medium_term, end_date)
     historical_df_long_term = fetch_historical_ticker_data(coin_id, start_date_long_term, end_date)
 
+    # Match the coin with Santiment slugs
+    santiment_slug = match_coins_with_santiment(coin_name, santiment_slugs_df)
+    
+    # If a Santiment slug is found, fetch Santiment data for the last 30 days
+    if santiment_slug:
+        santiment_data = fetch_santiment_data_for_coin(santiment_slug)
+    else:
+        santiment_data = {}
+
     if 'price' not in historical_df_long_term.columns or historical_df_long_term.empty:
         logging.debug(f"No valid price data available for {coin_id}.")
         return {"coin_id": coin_id, "coin_name": coin_name, "explanation": f"No valid price data available for {coin_id}."}
@@ -596,10 +707,14 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
 
     volatility = historical_df_long_term['price'].pct_change().std()
 
-    # Get price change score and detailed explanation
-    price_change_score, price_change_explanation = analyze_price_change(historical_df_long_term['price'], historical_df_long_term['market_cap'].iloc[-1], volatility)
+    # Get market cap and volume from the most recent entry)
+    most_recent_market_cap = int(historical_df_long_term['market_cap'].iloc[-1])
+    most_recent_volume_24h = int(historical_df_long_term['volume_24h'].iloc[-1])
 
-    volume_score, volume_explanation = analyze_volume_change(historical_df_long_term['volume_24h'], historical_df_long_term['market_cap'].iloc[-1], volatility)
+    # Get price change score and detailed explanation
+    price_change_score, price_change_explanation = analyze_price_change(historical_df_long_term['price'], most_recent_market_cap, volatility)
+
+    volume_score, volume_explanation = analyze_volume_change(historical_df_long_term['volume_24h'], most_recent_market_cap, volatility)
 
     consistent_growth = has_consistent_weekly_growth(historical_df_short_term)
     consistent_growth_score = 1 if consistent_growth else 0
@@ -615,10 +730,9 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
     event_score = 1 if recent_events_count > 0 else 0
 
     # Classify market cap
-    market_cap_class = classify_market_cap(historical_df_long_term['market_cap'].iloc[-1])
+    market_cap_class = classify_market_cap(most_recent_market_cap)
 
     # Calculate liquidity risk based on the most recent 24-hour volume
-    most_recent_volume_24h = historical_df_long_term['volume_24h'].iloc[-1]
     liquidity_risk = classify_liquidity_risk(most_recent_volume_24h, market_cap_class)
 
     # Integrate sentiment analysis
@@ -639,19 +753,23 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
     # Check if the coin is trending
     trending_score = get_fuzzy_trending_score(coin_id, coin_name, trending_coins_scores)
 
+    # Incorporate Santiment data into the cumulative score
+    santiment_score, santiment_explanation = compute_santiment_score_with_thresholds(santiment_data)
+
     # Calculate cumulative score and its percentage of the maximum score
     cumulative_score = (
         volume_score + tweet_score + consistent_growth_score + sustained_volume_growth_score + 
-        fear_and_greed_score + event_score + price_change_score + sentiment_score + surge_score + digest_score + trending_score
+        fear_and_greed_score + event_score + price_change_score + sentiment_score + surge_score +
+        digest_score + trending_score + santiment_score
     )
 
     # Maximum possible score (adjust as necessary)
-    max_possible_score = 14 + trending_score  # Increased due to digest_score and trending_score
+    max_possible_score = 13
 
     # Calculate the cumulative score as a percentage
     cumulative_score_percentage = (cumulative_score / max_possible_score) * 100
 
-    # Build the explanation string, including the detailed price change and surge word explanation
+    # Build the explanation string, including Santiment data and price change explanation
     explanation = f"{coin_name} ({coin_id}) analysis: "
     explanation += f"Liquidity Risk: {liquidity_risk}, "
     explanation += f"Price Change Score: {'Significant' if price_change_score else 'No significant change'} ({price_change_explanation}), "
@@ -663,13 +781,18 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
     explanation += f"Recent Events: {recent_events_count}, "
     explanation += f"Sentiment Score: {sentiment_score}, "
     explanation += f"Surge Keywords Score: {surge_score} ({surge_explanation}), "
+    explanation += f"Santiment Score: {santiment_score} ({santiment_explanation}), "
     explanation += f"News Digest Score: {digest_score}, "
     explanation += f"Trending Score: {trending_score}, "
+    explanation += f"Market Cap: {most_recent_market_cap}, "
+    explanation += f"Volume (24h): {most_recent_volume_24h}, "
     explanation += f"Cumulative Surge Score: {cumulative_score} ({cumulative_score_percentage:.2f}%)"
 
     return {
         "coin_id": coin_id,
         "coin_name": coin_name,
+        "market_cap": most_recent_market_cap,  # Add market cap to output
+        "volume_24h": most_recent_volume_24h,  # Add volume (24h) to output
         "price_change_score": f"{price_change_score}",
         "volume_change_score": f"{volume_score}",
         "tweets": len(twitter_df) if tweet_score else "None",
@@ -681,11 +804,14 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
         "surging_keywords_score": surge_score,
         "news_digest_score": digest_score,
         "trending_score": trending_score,
-        "liquidity_risk": liquidity_risk,  # Added liquidity risk
+        "liquidity_risk": liquidity_risk,
+        "santiment_score": santiment_score,
         "cumulative_score": cumulative_score,
         "cumulative_score_percentage": round(cumulative_score_percentage, 2),  # Rounded to 2 decimal places
         "explanation": explanation
     }
+
+
 
 
 def load_tickers(file_path):
@@ -782,12 +908,12 @@ def gpt4o_summarize_digest_and_extract_tickers(digest_text):
     prompt = f"""
     Analyze the following digest entries and provide the following:
     1) A concise summary in bullet points (no more than 250 words) of key news items likely to cause surges in the value of the mentioned coins. 
-    2) List the relevant cryptocurrency tickers beside each news item.
+    2) List the relevant cryptocurrency tickers beside each news item. Ensure there is no duplication.
 
     Text:
     {digest_text}
 
-    Respond **only** in JSON format with 'surge_summary' and 'tickers' as keys.
+    Respond **only** in JSON format with 'surge_summary' and 'tickers' as keys. Ensure the tickers are in alphabetical order and there are no duplicate tickers.
     """
 
     try:
@@ -880,6 +1006,113 @@ def get_sundown_digest():
         logging.debug(f"An error occurred: {err}")
     return []
 
+
+def fetch_santiment_metric(metric, coin_slug, start_date, end_date):
+    """
+    Fetches Santiment metric if it's part of the free metrics plan.
+
+    Parameters:
+        metric (str): The metric to fetch.
+        coin_slug (str): The Santiment slug of the cryptocurrency.
+        start_date (str): Start date in YYYY-MM-DD format.
+        end_date (str): End date in YYYY-MM-DD format.
+
+    Returns:
+        dict or None: The fetched data if the metric is free, otherwise None.
+    """
+    try:
+        # Log input parameters
+        logging.debug(f"Fetching Santiment metric: {metric} for coin: {coin_slug} from {start_date} to {end_date}")
+        
+        # Perform the API request
+        result = san.get(metric, slug=coin_slug, from_date=start_date, to_date=end_date)
+    
+        return result
+    
+    except Exception as e:
+        # Log any errors encountered
+        logging.error(f"Error fetching Santiment metric: {metric} for {coin_slug} from {start_date} to {end_date}. Error: {e}")
+        return None
+
+def calculate_percentage_increase(data):
+    """
+    Calculates the percentage increase over the period.
+    """
+    if data.empty or data['value'].sum() == 0:
+        return 0.0
+
+    first_value = data['value'].iloc[0]
+    last_value = data['value'].iloc[-1]
+
+    if first_value == 0:  # Avoid division by zero
+        return 100.0 if last_value > 0 else 0.0
+    else:
+        return ((last_value - first_value) / first_value) * 100
+
+def calculate_smooth_average(data, window=7):
+    """
+    Calculates a smooth moving average over a rolling window.
+    
+    Parameters:
+        data (pd.DataFrame): A DataFrame with a 'value' column and datetime index.
+        window (int): The rolling window size.
+
+    Returns:
+        float: The mean of the rolling average over the period.
+    """
+    if data.empty or data['value'].sum() == 0:
+        return 0.0
+
+    # Instead of inplace=True, we assign the result back to data['value']
+    data['value'] = data['value'].fillna(0)
+
+    # Apply rolling window for smoother averages
+    rolling_avg = data['value'].rolling(window=window).mean()
+
+    # Return the mean of the rolling average over the entire period
+    return rolling_avg.mean()
+
+
+def fetch_santiment_data_for_coin(coin_slug):
+    """
+    Fetches relevant Santiment data (social volume, dev activity, daily active addresses, etc.) for a specific coin.
+
+    Parameters:
+        coin_slug (str): The Santiment slug of the cryptocurrency.
+
+    Returns:
+        dict: A dictionary with fetched Santiment metrics data.
+    """
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+
+    # Development Activity
+    dev_activity_increase = fetch_santiment_metric('30d_moving_avg_dev_activity_change_1d', coin_slug, start_date, end_date)
+    
+    # Extract the first value from the fetched data
+    if not dev_activity_increase.empty:
+        dev_activity_increase = dev_activity_increase.iloc[-1]['value']  # Get the first row's 'value' column
+    else:
+        dev_activity_increase = 0  # Handle case where data is empty
+
+    # Daily Active Addresses
+    daily_active_addresses_increase = fetch_santiment_metric('active_addresses_24h_change_30d', coin_slug, start_date, end_date)
+    # Extract the first value from the fetched data
+    if not daily_active_addresses_increase.empty:
+        daily_active_addresses_increase = daily_active_addresses_increase.iloc[-1]['value']  # Get the first row's 'value' column
+    else:
+        daily_active_addresses_increase = 0  # Handle case where data is empty
+    
+    # Ensure all values are cast to Python's native `float` type
+    results = {
+        "dev_activity_increase": float(dev_activity_increase) if pd.notna(dev_activity_increase) else 0.0,
+        "daily_active_addresses_increase": float(daily_active_addresses_increase) if pd.notna(daily_active_addresses_increase) else 0.0,
+
+    }
+
+    return results
+
+
 def monitor_coins_and_send_report():
     """
     Main entry point to monitor the specified coins, fetch news, analyze sentiment,
@@ -890,59 +1123,35 @@ def monitor_coins_and_send_report():
     via email.
     """
     if TEST_ONLY:
-
-        # Test only mode: we only process a predefined list of coins
         existing_results = pd.DataFrame([])
-        # A predefined list of 10-20 coins to monitor for testing purposes
+        # Add a predefined mix of small, medium, and large-cap coins
         coins_to_monitor = [
-            # Large Cap Cryptocurrencies
-            {"id": "nmr-numeraire", "name": "Numeraire"},
+            # Large-cap coins
             {"id": "btc-bitcoin", "name": "Bitcoin"},
             {"id": "eth-ethereum", "name": "Ethereum"},
             {"id": "bnb-binancecoin", "name": "Binance Coin"},
-            {"id": "ada-cardano", "name": "Cardano"},
-            {"id": "xrp-ripple", "name": "Ripple"},
-            
-            # Mid Cap Cryptocurrencies
-            {"id": "algo-algorand", "name": "Algorand"},
-            {"id": "ftm-fantom", "name": "Fantom"},
-            {"id": "near-near-protocol", "name": "Near Protocol"},
-            {"id": "mana-decentraland", "name": "Decentraland"},
-            {"id": "grt-the-graph", "name": "The Graph"},
-            {"id": "icp-internet-computer", "name": "Internet Computer"},
-            {"id": "hbar-hedera", "name": "Hedera"},
-            {"id": "sand-the-sandbox", "name": "The Sandbox"},
-            {"id": "enj-enjin-coin", "name": "Enjin Coin"},
-            
-            # Small Cap Cryptocurrencies
-            {"id": "rune-thorchain", "name": "THORChain"},
-            {"id": "rndr-render-token", "name": "Render Token"},
-            {"id": "ogn-origin-protocol", "name": "Origin Protocol"},
-            {"id": "ctsi-cartesi", "name": "Cartesi"},
-            {"id": "holo-holo", "name": "Holo"},
-            {"id": "storj-storj", "name": "Storj"},
-        ]
 
+            # Medium-cap coins
+            {"id": "dot-polkadot", "name": "Polkadot"},
+            {"id": "ada-cardano", "name": "Cardano"},
+            {"id": "sol-solana", "name": "Solana"},
+
+            # Small-cap coins
+             {"id": "matic-polygon", "name": "Polygon"},
+             {"id": "ftt-ftx-token", "name": "FTX Token"},
+             {"id": "near-near-protocol", "name": "Near Protocol"},
+             {"id": "avax-avalanche", "name": "Avalanche"}
+        ]
     else:
-        # Normal mode: retrieve coins from CoinPaprika API
         existing_results = load_existing_results()
         coins_to_monitor = api_call_with_retries(client.coins)
-
-        # Report the number of coins retrieved
-        num_coins_retrieved = len(coins_to_monitor)
-        logging.debug(f"Number of coins retrieved: {num_coins_retrieved}")
-        print(f"Number of coins retrieved: {num_coins_retrieved}")
-
-        # Filter coins based on rank and active status, limit to 1000 coins
-        coins_to_monitor = filter_active_and_ranked_coins(coins_to_monitor, 71909)
+        logging.debug(f"Number of coins retrieved: {len(coins_to_monitor)}")
+        coins_to_monitor = filter_active_and_ranked_coins(coins_to_monitor, 1000)
 
     logging.debug(f"Number of active and ranked coins selected: {len(coins_to_monitor)}")
-    print(f"Number of active and ranked coins selected: {len(coins_to_monitor)}")
-
     end_date = datetime.now().strftime('%Y-%m-%d')
 
     report_entries = []
-
     tickers_dict = load_tickers(CRYPTO_NEWS_TICKERS)
 
     # Fetch and summarize the Sundown Digest
@@ -953,10 +1162,13 @@ def monitor_coins_and_send_report():
     # Fetch Trending Coins data once
     trending_coins_scores = fetch_trending_coins_scores()
 
+    # Load Santiment slugs
+    santiment_slugs_df = fetch_santiment_slugs()
+
     for coin in coins_to_monitor:
         try:
             coin_id = coin['id']
-            coin_name = coin['name']
+            coin_name = coin['name'].lower()
 
             if not existing_results.empty and coin_id in existing_results['coin_id'].values:
                 logging.debug(f"Skipping already processed coin: {coin_id}")
@@ -966,8 +1178,8 @@ def monitor_coins_and_send_report():
             coins_dict = {coin_name: tickers_dict.get(coin_name, '').upper()}
             news_df = fetch_news_for_past_week(coins_dict)
 
-            # Analyze coin and save the result
-            result = analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores)
+            # Analyze coin and save the result, passing the Santiment slug
+            result = analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending_coins_scores, santiment_slugs_df)
             logging.debug(f"Result for {coin_name}: {result}")
 
             save_result_to_csv(result)
@@ -980,20 +1192,44 @@ def monitor_coins_and_send_report():
             logging.debug(traceback.format_exc())
             continue
 
-    # Final report generation...
+    df = pd.DataFrame(report_entries)
 
-    # Ensure all cumulative_score values are numeric (default to 0 if None)
-    for entry in report_entries:
-        if entry['cumulative_score'] is None:
-            entry['cumulative_score'] = 0
+    if not df.empty:
+        # Filter the report_entries based on liquidity risk and cumulative score percentage
+        df = df[(df['liquidity_risk'].isin(['Low', 'Medium'])) & (df['cumulative_score_percentage'] > CUMULATIVE_SCORE_REPORTING_THRESHOLD)]
 
-    # Final report generation if everything else succeeds
-    if report_entries:
-        report_entries = sorted(report_entries, key=lambda x: x.get('cumulative_score', 0), reverse=True)
-        print_command_line_report(report_entries, digest_summary)
-        html_report = generate_html_report(report_entries, digest_summary)  # Pass digest_summary here
-        send_email_with_report(html_report)
+        logging.debug("DataFrame is not empty, processing report entries.")
         
+        # Convert DataFrame to dictionary records and sort by cumulative score
+        report_entries = df.to_dict('records')
+        logging.debug(f"Report entries before sorting: {report_entries}")
+        
+        report_entries = sorted(report_entries, key=lambda x: x.get('cumulative_score', 0), reverse=True)
+        logging.debug(f"Report entries after sorting: {report_entries}")
+
+        # Assuming logging is already configured elsewhere in your code
+        logging.debug(f"DataFrame contents before GPT-4o recommendations:\n{df.to_string()}")
+
+        # Get GPT-4o recommendations
+        logging.debug("Requesting GPT-4o recommendations.")
+        gpt_recommendations = gpt4o_analyze_and_recommend(df)
+        logging.debug(f"GPT-4o recommendations: {gpt_recommendations}")
+
+        # Generate HTML report with recommendations
+        logging.debug("Generating HTML report.")
+        html_report = generate_html_report_with_recommendations(report_entries, digest_summary, gpt_recommendations)
+        logging.debug("HTML report generated successfully.")
+
+        # Save the report to Excel
+        logging.debug("Saving report to Excel.")
+        attachment_path = save_report_to_excel(report_entries)
+        logging.debug(f"Report saved to Excel at: {attachment_path}")
+
+        # Send email with the report and attachment
+        logging.debug("Sending email with the report and attachment.")
+        send_email_with_report(html_report, attachment_path)
+        logging.debug("Email sent successfully.")
+
         # Delete the surging_coins.csv file after sending the email
         if os.path.exists(RESULTS_FILE):
             try:
@@ -1002,9 +1238,9 @@ def monitor_coins_and_send_report():
             except Exception as e:
                 logging.debug(f"Failed to delete {RESULTS_FILE}: {e}")
     else:
-        logging.debug("No valid entries to report.")
+        logging.debug("No valid entries to report. DataFrame is empty.")
 
-
+        
 def normalize_score(raw_score, min_score, max_score, range=3):
     """
     Normalize a score to be between 0 and 3 and return the nearest integer.
@@ -1312,42 +1548,109 @@ def print_command_line_report(report_entries, digest_summary):
     logging.debug(tabulate(df, headers="keys", tablefmt="grid"))
     logging.debug(f"\nReport generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-def generate_html_report(report_entries, digest_summary):
+def gpt4o_analyze_and_recommend(df):
     """
-    Generates an HTML report from the report entries and includes the Sundown Digest summary.
+    Uses GPT-4o to analyze the final results DataFrame and provide structured recommendations for coin purchases.
+
+    Parameters:
+        df (pd.DataFrame): The final DataFrame containing coin analysis results.
+
+    Returns:
+        dict: A structured summary of GPT-4o's recommendations for coin purchases, including reasons.
+    """
+    # Convert the entire DataFrame to a JSON format for GPT-4o input
+    df_json = df.to_dict(orient='records')
+
+    # Adjust the prompt to request structured JSON output
+    prompt = f"""
+    You are provided with detailed analysis data for several cryptocurrency coins. Using this data, provide a concise summary of which coins should be considered for purchase, along with the reasons for the recommendation. Only consider coins that have a potential of a breakout or a surge in value.
+
+    **Do not repeat or summarize the dataset.** Instead, return the recommendations in structured JSON format with each recommended coin and its reason for recommendation.
+
+    Format your response as follows:
+    {{
+        "recommendations": [
+            {{
+                "coin": "Coin Name",
+                "liquidity_risk": "Low/Medium/High",
+                "cumulative_score": "Score Value",
+                "reason": "Concise reason for recommendation"
+            }},
+            ...
+        ]
+    }}
+
+    Here is the data for your analysis:
+    {json.dumps(df_json, indent=2)}
+    """
+
+    try:
+        # Call the OpenAI API to generate recommendations
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            n=1,
+            max_tokens=4000,
+            stop=None,
+            temperature=0.1
+        )
+
+        # Extract the response content (the actual GPT output text)
+        gpt_message_content = response['choices'][0]['message']['content']
+
+        # Log the GPT response for debugging
+        logging.debug("Response_content: " + gpt_message_content)
+        
+        # Extract the JSON part using regex
+        json_match = re.search(r'```json(.*?)```', gpt_message_content, re.DOTALL)
+
+        # Check if JSON part is found and not empty
+        if json_match:
+            json_content = json_match.group(1).strip()
+
+            # Check if the extracted content is empty
+            if not json_content:
+                logging.debug("Error: JSON content is empty.")
+            else:
+                # Try to parse the JSON content
+                try:
+                    parsed_data = json.loads(json_content)
+                    logging.debug("Parsed JSON data:", parsed_data)
+                except json.JSONDecodeError as e:
+                    logging.debug(f"Failed to parse JSON: {e}")
+        else:
+            logging.debug("No JSON found in the log message.")
+     
+        # Check if the 'recommendations' field is empty
+        if not parsed_data['recommendations']:
+            logging.debug("No recommendations found in the response.")
+        else:
+            logging.debug(f"Recommendations found: {parsed_data['recommendations']}")
+
+        return parsed_data
+
+    except (openai.error.OpenAIError, json.JSONDecodeError) as e:
+        logging.debug(f"Error in GPT-4o analysis: {e}")
+        return {"recommendations": []}
+
+
+def generate_html_report_with_recommendations(report_entries, digest_summary, gpt_recommendations):
+    """
+    Generates an HTML report with summaries from the report entries and GPT-4o recommendations.
 
     Args:
         report_entries (list): List of report entries to include in the report.
         digest_summary (dict): Summary of the Sundown Digest to include at the top.
+        gpt_recommendations (dict): GPT-4o's recommendations for coin purchases, structured as a list of dictionaries.
 
     Returns:
         str: HTML content of the report.
     """
-    df = pd.DataFrame(report_entries)
-
-    # Create a new column with links to CoinPaprika for each coin
-    df['coin_link'] = df['coin_id'].apply(lambda coin_id: f'<a href="https://coinpaprika.com/coin/{coin_id}/">View on CoinPaprika</a>')
-
-    # Sort the DataFrame by cumulative score in descending order
-    df = df.sort_values(by="cumulative_score", ascending=False)
-
-    # Format the column headers to proper words without underscores
-    df.columns = df.columns.str.replace('_', ' '). str.title()
-
-    # Rename the 'Coin Link' column to match the formatting
-    df.rename(columns={"Coin Link": "Link To Coin"}, inplace=True)
-
-    # Check if 'Explanation' column exists before applying the lambda function
-    if 'Explanation' in df.columns:
-        df['Explanation'] = df['Explanation'].apply(lambda x: x.replace(" | ", "<br>"))
-
-    # Create the HTML table with enhanced styling and include the link
-    html_table = df.to_html(index=False, escape=False, classes='table table-striped', table_id="crypto-table")
-
-    # Create the Sundown Digest section with improved styling
+   
+    # Sundown Digest Summary section with improved inline styling
     digest_html = f"""
-    <div style="background-color:#f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-        <h3 style="color: #4CAF50;">Sundown News Digest Summary</h3>
+    <div style="background-color:#f1f1f1; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
+        <h3 style="color: #264653;">Sundown Digest Summary</h3>
         <p><strong>Tickers:</strong> {', '.join(digest_summary['tickers'])}</p>
         <p><strong>News Summary:</strong></p>
         <ul style="padding-left: 20px;">
@@ -1356,53 +1659,62 @@ def generate_html_report(report_entries, digest_summary):
     </div>
     """
 
+    print(gpt_recommendations['recommendations'])
+
+    if not gpt_recommendations['recommendations']:
+        recommendations_html = """
+        <div style="background-color:#f9f9f9; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
+            <h3 style="color: #e76f51;">AI Generated Coin Recommendations</h3>
+            <p>There are currently no coins recommended for purchase based on the analysis.</p>
+        </div>
+        """
+    else:
+        recommendations_html = f"""
+        <div style="background-color:#f9f9f9; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
+            <h3 style="color: #2a9d8f;">AI Generated Coin Recommendations</h3>
+            <ul style="padding-left: 20px;">
+                {''.join(f'<li><b>{item["coin"]}</b> - {item["reason"]}</li>' for item in gpt_recommendations['recommendations'])}
+            </ul>
+        </div>
+        """
+
+
+    # Complete HTML content with summaries only
     html_content = f"""
     <html>
     <head>
         <style>
             body {{
                 font-family: Arial, sans-serif;
-                color: #333;
-                background-color: #f4f4f4;
+                background-color: #f9f9f9;
                 margin: 0;
                 padding: 20px;
+                color: #333;
             }}
             h2 {{
-                color: #2c3e50;
                 text-align: center;
-                margin-bottom: 30px;
-            }}
-            #crypto-table {{
-                width: 100%;
-                border-collapse: collapse;
+                color: #264653;
                 margin-bottom: 20px;
             }}
-            #crypto-table th, #crypto-table td {{
-                padding: 10px 15px;
-                border: 1px solid #ddd;
-                text-align: left;
-                vertical-align: top;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
+            h3 {{
+                color: #2a9d8f;
             }}
-            #crypto-table th {{
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
+            ul {{
+                list-style: none;
+                padding-left: 0;
             }}
-            #crypto-table tr:nth-child(even) {{
-                background-color: #f9f9f9;
-            }}
-            #crypto-table tr:hover {{
-                background-color: #f1f1f1;
+            li {{
+                margin-bottom: 10px;
+                font-size: 14px;
             }}
         </style>
     </head>
     <body>
-        <h2>Weekly Report: Coin Analysis</h2>
+        <h2>Weekly Coin Analysis Report</h2>
+
         {digest_html}
-        {html_table}
+        {recommendations_html}
+
         <p style="text-align: center; color: #777;">Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
     </body>
     </html>
@@ -1410,30 +1722,116 @@ def generate_html_report(report_entries, digest_summary):
     return html_content
 
 
-def send_email_with_report(html_content):
+def save_report_to_excel(report_entries, filename='coin_analysis_report.xlsx'):
     """
-    Sends an email with the given HTML content to the recipient specified by EMAIL_TO.
+    Saves the report entries to an Excel file with enhanced formatting and styling.
 
-    This function uses the Brevo SMTP server to send the email.
+    Args:
+        report_entries (list): A list of dictionaries containing the report data.
+        filename (str): The name of the Excel file to save the report to.
+    """
+    # Convert the report entries to a pandas DataFrame
+    df = pd.DataFrame(report_entries)
+    
+    # Save DataFrame to an Excel file without formatting
+    df.to_excel(filename, index=False)
+    
+    # Open the Excel file with openpyxl for formatting
+    workbook = load_workbook(filename)
+    sheet = workbook.active
 
-    Parameters:
+    # Define styles for headers and cells
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", fgColor="4F81BD")
+    cell_font = Font(name="Arial", size=10)
+    cell_alignment = Alignment(horizontal="left", vertical="top", wrap_text=False)  # Turn off wrap_text for content cells
+    
+    # Define border style
+    thin_border = Border(left=Side(style="thin"), right=Side(style="thin"),
+                         top=Side(style="thin"), bottom=Side(style="thin"))
+
+    # Apply header styles (background color, font, alignment)
+    for col in sheet.iter_cols(min_row=1, max_row=1, min_col=1, max_col=sheet.max_column):
+        max_length = 0
+        column = col[0].column_letter  # Get the column letter for header
+        for cell in col:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)  # Turn wrapping off for headers
+            cell.border = thin_border
+            # Adjust column width based on header content
+            if len(str(cell.value)) > max_length:
+                max_length = len(str(cell.value))
+
+        adjusted_width = (max_length + 2) * 1.2  # Add some padding for headers
+        sheet.column_dimensions[column].width = adjusted_width
+
+    # Apply cell styles (font, alignment, borders) and auto-adjust column width based on content
+    for col in sheet.iter_cols(min_row=1, max_row=sheet.max_row, min_col=1, max_col=sheet.max_column):
+        max_length = 0
+        column = col[0].column_letter  # Get the column letter for data cells
+
+        for cell in col:
+            cell.font = cell_font
+            cell.alignment = cell_alignment
+            cell.border = thin_border
+
+            # Adjust column width based on the content
+            try:
+                if cell.value:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+            except Exception as e:
+                print(f"Error processing cell {cell.coordinate}: {e}")
+
+        # Set the column width to fit the content with padding
+        adjusted_width = (max_length + 2) * 1.2  # Add padding for cells
+        sheet.column_dimensions[column].width = adjusted_width
+
+    # Freeze the top row (headers) for better readability
+    sheet.freeze_panes = "A2"
+
+    # Save the workbook with the formatting applied
+    try:
+        workbook.save(filename)
+        print(f"Report saved to {filename} with enhanced formatting.")
+    except Exception as e:
+        print(f"Error saving the report: {e}")
+    finally:
+        workbook.close()
+
+    return filename
+
+
+def send_email_with_report(html_content, attachment_path):
+    """
+    Sends an email with the given HTML content and attaches the Excel file.
+
+    Args:
         html_content (str): The HTML content of the email.
-
-    Returns:
-        None
+        attachment_path (str): Path to the Excel file to attach.
     """
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = "Weekly Report: Coin Analysis"
+    msg['Subject'] = "AI Generated Coin Analysis Report"
     msg['From'] = EMAIL_FROM
     msg['To'] = EMAIL_TO
 
+    # Attach HTML content
     part = MIMEText(html_content, 'html')
     msg.attach(part)
 
+    # Attach Excel file
+    with open(attachment_path, "rb") as file:
+        attachment = MIMEText(file.read(), 'base64', 'utf-8')
+        attachment.add_header('Content-Disposition', 'attachment', filename=os.path.basename(attachment_path))
+        msg.attach(attachment)
+
+    # Send the email
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USERNAME, SMTP_PASSWORD)
         server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+
 
 if __name__ == "__main__":
     monitor_coins_and_send_report()
