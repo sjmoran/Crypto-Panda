@@ -1034,45 +1034,6 @@ def fetch_santiment_metric(metric, coin_slug, start_date, end_date):
         logging.error(f"Error fetching Santiment metric: {metric} for {coin_slug} from {start_date} to {end_date}. Error: {e}")
         return None
 
-def calculate_percentage_increase(data):
-    """
-    Calculates the percentage increase over the period.
-    """
-    if data.empty or data['value'].sum() == 0:
-        return 0.0
-
-    first_value = data['value'].iloc[0]
-    last_value = data['value'].iloc[-1]
-
-    if first_value == 0:  # Avoid division by zero
-        return 100.0 if last_value > 0 else 0.0
-    else:
-        return ((last_value - first_value) / first_value) * 100
-
-def calculate_smooth_average(data, window=7):
-    """
-    Calculates a smooth moving average over a rolling window.
-    
-    Parameters:
-        data (pd.DataFrame): A DataFrame with a 'value' column and datetime index.
-        window (int): The rolling window size.
-
-    Returns:
-        float: The mean of the rolling average over the period.
-    """
-    if data.empty or data['value'].sum() == 0:
-        return 0.0
-
-    # Instead of inplace=True, we assign the result back to data['value']
-    data['value'] = data['value'].fillna(0)
-
-    # Apply rolling window for smoother averages
-    rolling_avg = data['value'].rolling(window=window).mean()
-
-    # Return the mean of the rolling average over the entire period
-    return rolling_avg.mean()
-
-
 def fetch_santiment_data_for_coin(coin_slug):
     """
     Fetches relevant Santiment data (social volume, dev activity, daily active addresses, etc.) for a specific coin.
