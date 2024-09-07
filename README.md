@@ -83,7 +83,13 @@ The recommendations are based on the cumulative score of these metrics and provi
 
 ## Deployment
 
-A pattern that I have found successful to deploy an EC2 instance (micro) using a CloudFormation script (to instantiate the VPC and subnets and the security groups and IAM roles). Then schedule via EventBridge a signal to kick off the script on the EC2 instance at a regular interval (I have chosen twice a week). The EC2 is set to destruct after 48 hours, with the lambda reviving whenever a run of the script is needed. This keeps the costs reasonable.
+A pattern that I have found successful to deploy an EC2 instance (t2.micro) using a CloudFormation script (to instantiate the VPC and subnets and the security groups and IAM roles). Then schedule via EventBridge an event to kick off a Lambda function that will invoke the script on the EC2 instance at a regular interval (I have chosen once a week).
+
+The EC2 is set to shutdown after 96 hours, with the lambda reviving the EC2 instance whenever a run of the script is needed. This keeps the costs down, however a t2.micro running continuously for month only costs around $8.
+
+Also note that you will incur some costs for access to the CoinPaprika and CryptoNews APIs, totalling around $100 a month. Both services have free tiers worth exploring initially, however any serious work may require a subscription.
+
+Finally, worth keeping in mind is that the tool takes around 20 hours to process 1000 coins, which is far from real time! This is mostly due to the wait times for the API access, and is an area that can be improved in future iterations.
 
 ## Contributing
 
