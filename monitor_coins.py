@@ -9,7 +9,6 @@ import time
 from tabulate import tabulate
 from dotenv import load_dotenv
 import requests
-import traceback
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import openai  # Assuming GPT-4 is accessible via OpenAI API
 import json
@@ -22,6 +21,19 @@ from fuzzywuzzy import process
 import san
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+import psycopg2
+from psycopg2 import Error
+import matplotlib.pyplot as plt
+import traceback
+import pandas as pd
+from psycopg2 import sql, OperationalError
+import base64
+from io import BytesIO
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from email.mime.image import MIMEImage  # This will fix the NameError
 
 # Initialize Sanpy API key
 SAN_API_KEY = os.getenv('SAN_API_KEY')
@@ -79,7 +91,7 @@ TEST_ONLY = False  # Set to False to monitor all coins
 MAX_RETRIES = 2  # Maximum number of retries for API calls
 BACKOFF_FACTOR = 2  # Factor by which the wait time increases after each failure
 
-CUMULATIVE_SCORE_REPORTING_THRESHOLD=30 # Only report results with cumulative score above this % value
+CUMULATIVE_SCORE_REPORTING_THRESHOLD=50 # Only report results with cumulative score above this % value
 
 def api_call_with_retries(api_function, *args, **kwargs):
     """
@@ -313,6 +325,67 @@ def classify_volatility(volatility):
         return "Low"
 
 
+def save_cumulative_score_to_aurora(coin_id, coin_name, cumulative_score):
+    """
+    Save a cumulative score for a specific coin in Amazon Aurora (PostgreSQL) with a date-based timestamp.
+
+    Parameters:
+        coin_id (str): The unique identifier for the coin.
+        coin_name (str): The name of the coin.
+        cumulative_score (float): The cumulative score of the coin.
+    """
+    connection = None  # Initialize connection variable
+    cursor = None  # Initialize cursor variable
+    
+    try:
+        # Establish connection to PostgreSQL Aurora instance
+        connection = psycopg2.connect(
+            host=os.getenv('AURORA_HOST'),
+            database=os.getenv('AURORA_DB'),
+            user=os.getenv('AURORA_USER'),
+            password=os.getenv('AURORA_PASSWORD'),
+            port=os.getenv('AURORA_PORT', 5432)  # Default port for PostgreSQL is 5432
+        )
+        
+        cursor = connection.cursor()
+
+        # Insert the cumulative score with the current date (no time part)
+        insert_query = """
+            INSERT INTO coin_data (coin_id, coin_name, cumulative_score, timestamp)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (coin_id, timestamp) 
+            DO UPDATE SET cumulative_score = EXCLUDED.cumulative_score;
+        """
+        
+        # Truncate timestamp to just the day (remove time component)
+        current_date = datetime.now().date()  # Get only the date part
+        
+        cursor.execute(insert_query, (coin_id, coin_name, cumulative_score, current_date))
+        
+        connection.commit()
+        print(f"Cumulative score for {coin_name} saved/updated successfully for {current_date}.")
+    
+    except psycopg2.OperationalError as e:
+        print(f"Error connecting to Amazon Aurora DB: {e}")
+    
+    finally:
+        # Check if cursor was created and close it
+        if cursor is not None:
+            try:
+                cursor.close()
+                print("Cursor is closed.")
+            except Exception as e:
+                print(f"Error closing cursor: {e}")
+
+        # Check if connection was created and close it
+        if connection is not None:
+            try:
+                connection.close()
+                print("PostgreSQL connection is closed.")
+            except Exception as e:
+                print(f"Error closing connection: {e}")
+
+
 def get_volume_thresholds(market_cap_class, volatility_class):
     """
     Returns the volume thresholds for a given market capitalization class and volatility class.
@@ -449,11 +522,19 @@ def match_coins_with_santiment(coin_name, santiment_slugs_df):
     Returns:
     str: The Santiment slug if a match is found, else None.
     """    
+    # Check if the 'name_normalized' column exists in the dataframe
+    if 'name_normalized' not in santiment_slugs_df.columns:
+        logging.warning(f"'name_normalized' column not found in the Santiment slugs dataframe.")
+        return None
+
     # Look for exact matches in the normalized names
     match = santiment_slugs_df[santiment_slugs_df['name_normalized'] == coin_name]
     
     if not match.empty:
         return match['slug'].values[0]  # Return the first matching slug
+    else:
+        logging.info(f"No match found for {coin_name} in Santiment slugs.")
+    
     return None
 
 
@@ -614,6 +695,7 @@ def classify_liquidity_risk(volume_24h, market_cap_class):
             return "Medium"
         else:
             return "Low"
+
 def compute_santiment_score_with_thresholds(santiment_data):
     """
     Computes a binary score using Santiment data by applying thresholds for each metric and provides explanations for each score.
@@ -691,12 +773,13 @@ def analyze_coin(coin_id, coin_name, end_date, news_df, digest_tickers, trending
 
     # Match the coin with Santiment slugs
     santiment_slug = match_coins_with_santiment(coin_name, santiment_slugs_df)
-    
+
     # If a Santiment slug is found, fetch Santiment data for the last 30 days
     if santiment_slug:
         santiment_data = fetch_santiment_data_for_coin(santiment_slug)
     else:
-        santiment_data = {}
+        santiment_data = {"dev_activity_increase": 0, "daily_active_addresses_increase": 0}
+
 
     if 'price' not in historical_df_long_term.columns or historical_df_long_term.empty:
         logging.debug(f"No valid price data available for {coin_id}.")
@@ -1010,6 +1093,7 @@ def get_sundown_digest():
 def fetch_santiment_metric(metric, coin_slug, start_date, end_date):
     """
     Fetches Santiment metric if it's part of the free metrics plan.
+    If fetching fails, returns None, allowing the rest of the code to continue.
 
     Parameters:
         metric (str): The metric to fetch.
@@ -1018,61 +1102,101 @@ def fetch_santiment_metric(metric, coin_slug, start_date, end_date):
         end_date (str): End date in YYYY-MM-DD format.
 
     Returns:
-        dict or None: The fetched data if the metric is free, otherwise None.
+        float or None: The fetched data if available, or None if the API call fails.
     """
     try:
-        # Log input parameters
-        logging.debug(f"Fetching Santiment metric: {metric} for coin: {coin_slug} from {start_date} to {end_date}")
-        
-        # Perform the API request
+        logging.debug(f"Fetching Santiment metric: {metric} for coin: {coin_slug}")
         result = san.get(metric, slug=coin_slug, from_date=start_date, to_date=end_date)
-    
-        return result
-    
+        if not result.empty:
+            # Extract the latest value
+            return result.iloc[-1]['value']
+        else:
+            logging.debug(f"No data found for metric {metric} for coin {coin_slug}")
+            return None
     except Exception as e:
-        # Log any errors encountered
-        logging.error(f"Error fetching Santiment metric: {metric} for {coin_slug} from {start_date} to {end_date}. Error: {e}")
+        logging.error(f"Error fetching Santiment metric: {metric} for {coin_slug}: {e}")
         return None
+
 
 def fetch_santiment_data_for_coin(coin_slug):
     """
     Fetches relevant Santiment data (social volume, dev activity, daily active addresses, etc.) for a specific coin.
+    If the Santiment API fails, returns an empty result, allowing the rest of the code to execute.
 
     Parameters:
         coin_slug (str): The Santiment slug of the cryptocurrency.
 
     Returns:
-        dict: A dictionary with fetched Santiment metrics data.
+        dict: A dictionary with fetched Santiment metrics data or default values if the API call fails.
     """
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    try:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
 
-    # Development Activity
-    dev_activity_increase = fetch_santiment_metric('30d_moving_avg_dev_activity_change_1d', coin_slug, start_date, end_date)
+        # Fetch development activity
+        dev_activity_increase = fetch_santiment_metric('30d_moving_avg_dev_activity_change_1d', coin_slug, start_date, end_date)
+        dev_activity_increase = dev_activity_increase.iloc[-1]['value'] if not dev_activity_increase.empty else 0.0
+
+        # Fetch daily active addresses
+        daily_active_addresses_increase = fetch_santiment_metric('active_addresses_24h_change_30d', coin_slug, start_date, end_date)
+        daily_active_addresses_increase = daily_active_addresses_increase.iloc[-1]['value'] if not daily_active_addresses_increase.empty else 0.0
+
+        return {
+            "dev_activity_increase": float(dev_activity_increase),
+            "daily_active_addresses_increase": float(daily_active_addresses_increase),
+        }
+
+    except Exception as e:
+        logging.error(f"Error fetching Santiment data for {coin_slug}: {e}")
+        # Return default values if there's an error
+        return {
+            "dev_activity_increase": 0.0,
+            "daily_active_addresses_increase": 0.0,
+        }
+
+
+def create_coin_data_table_if_not_exists():
+    """
+    Creates the 'coin_data' table in Amazon Aurora (PostgreSQL) if it doesn't already exist,
+    storing time series data for cumulative scores.
+    """
+    connection = None  # Initialize the connection variable to None
+    try:
+        # Connect to PostgreSQL Aurora instance
+        connection = psycopg2.connect(
+            host=os.getenv('AURORA_HOST'),
+            database=os.getenv('AURORA_DB'),
+            user=os.getenv('AURORA_USER'),
+            password=os.getenv('AURORA_PASSWORD'),
+            port=os.getenv('AURORA_PORT', 5432)  # Default port for PostgreSQL is 5432
+        )
+        
+        cursor = connection.cursor()
+
+        # SQL to create the table if it doesn't exist, allowing time series data
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS coin_data (
+            id SERIAL PRIMARY KEY,
+            coin_id VARCHAR(255) NOT NULL,
+            coin_name VARCHAR(255) NOT NULL,
+            cumulative_score FLOAT NOT NULL,
+            timestamp DATE DEFAULT CURRENT_DATE,
+            UNIQUE (coin_id, timestamp)  -- Unique constraint to ensure one entry per coin per day
+        );
+        """
+        cursor.execute(create_table_query)
+        connection.commit()
+        print("Table created or already exists.")
+
+    except OperationalError as e:
+        print(f"Error while connecting to Amazon Aurora: {e}")
     
-    # Extract the first value from the fetched data
-    if not dev_activity_increase.empty:
-        dev_activity_increase = dev_activity_increase.iloc[-1]['value']  # Get the first row's 'value' column
-    else:
-        dev_activity_increase = 0  # Handle case where data is empty
-
-    # Daily Active Addresses
-    daily_active_addresses_increase = fetch_santiment_metric('active_addresses_24h_change_30d', coin_slug, start_date, end_date)
-    # Extract the first value from the fetched data
-    if not daily_active_addresses_increase.empty:
-        daily_active_addresses_increase = daily_active_addresses_increase.iloc[-1]['value']  # Get the first row's 'value' column
-    else:
-        daily_active_addresses_increase = 0  # Handle case where data is empty
-    
-    # Ensure all values are cast to Python's native `float` type
-    results = {
-        "dev_activity_increase": float(dev_activity_increase) if pd.notna(dev_activity_increase) else 0.0,
-        "daily_active_addresses_increase": float(daily_active_addresses_increase) if pd.notna(daily_active_addresses_increase) else 0.0,
-
-    }
-
-    return results
-
+    finally:
+        # Close the connection if it was successfully created
+        if connection:
+            cursor.close()
+            connection.close()
+            print("PostgreSQL connection is closed.")
 
 def monitor_coins_and_send_report():
     """
@@ -1083,25 +1207,15 @@ def monitor_coins_and_send_report():
     saved to a file. Otherwise, all coins are processed and the results are sent
     via email.
     """
+    # Ensure the table is created in Amazon Aurora if it doesn't exist
+    create_coin_data_table_if_not_exists()
+
     if TEST_ONLY:
         existing_results = pd.DataFrame([])
         # Add a predefined mix of small, medium, and large-cap coins
         coins_to_monitor = [
-            # Large-cap coins
             {"id": "btc-bitcoin", "name": "Bitcoin"},
             {"id": "eth-ethereum", "name": "Ethereum"},
-            {"id": "bnb-binancecoin", "name": "Binance Coin"},
-
-            # Medium-cap coins
-            {"id": "dot-polkadot", "name": "Polkadot"},
-            {"id": "ada-cardano", "name": "Cardano"},
-            {"id": "sol-solana", "name": "Solana"},
-
-            # Small-cap coins
-             {"id": "matic-polygon", "name": "Polygon"},
-             {"id": "ftt-ftx-token", "name": "FTX Token"},
-             {"id": "near-near-protocol", "name": "Near Protocol"},
-             {"id": "avax-avalanche", "name": "Avalanche"}
         ]
     else:
         existing_results = load_existing_results()
@@ -1128,6 +1242,7 @@ def monitor_coins_and_send_report():
 
     for coin in coins_to_monitor:
         try:
+            print(f"Processing {coin['name']} ({coin['id']})")
             coin_id = coin['id']
             coin_name = coin['name'].lower()
 
@@ -1146,6 +1261,9 @@ def monitor_coins_and_send_report():
             save_result_to_csv(result)
             report_entries.append(result)
 
+            # Save the cumulative score to Amazon Aurora
+            save_cumulative_score_to_aurora(result['coin_id'], result['coin_name'], result['cumulative_score_percentage'])
+
             time.sleep(20)
 
         except Exception as e:
@@ -1160,34 +1278,38 @@ def monitor_coins_and_send_report():
         df = df[(df['liquidity_risk'].isin(['Low', 'Medium'])) & (df['cumulative_score_percentage'] > CUMULATIVE_SCORE_REPORTING_THRESHOLD)]
 
         logging.debug("DataFrame is not empty, processing report entries.")
-        
-        # Convert DataFrame to dictionary records and sort by cumulative score
+
+        # Extract the coin names from the filtered DataFrame
+        coins_in_df = df['coin_name'].unique()  # Extract unique coin names from the filtered DataFrame
+
+        if len(coins_in_df) > 0:
+            # Retrieve historical data from Amazon Aurora
+            historical_data = retrieve_historical_data_from_aurora()
+
+            if not historical_data.empty:
+                # Filter the historical data for only the coins present in the filtered df
+                plot_top_coins_over_time(historical_data[historical_data['coin_name'].isin(coins_in_df)], top_n=len(coins_in_df))
+
+        # Proceed with sorting and generating the report
         report_entries = df.to_dict('records')
-        logging.debug(f"Report entries before sorting: {report_entries}")
-        
         report_entries = sorted(report_entries, key=lambda x: x.get('cumulative_score', 0), reverse=True)
         logging.debug(f"Report entries after sorting: {report_entries}")
 
-        # Assuming logging is already configured elsewhere in your code
         logging.debug(f"DataFrame contents before GPT-4o recommendations:\n{df.to_string()}")
 
         # Get GPT-4o recommendations
-        logging.debug("Requesting GPT-4o recommendations.")
         gpt_recommendations = gpt4o_analyze_and_recommend(df)
         logging.debug(f"GPT-4o recommendations: {gpt_recommendations}")
 
         # Generate HTML report with recommendations
-        logging.debug("Generating HTML report.")
         html_report = generate_html_report_with_recommendations(report_entries, digest_summary, gpt_recommendations)
         logging.debug("HTML report generated successfully.")
 
         # Save the report to Excel
-        logging.debug("Saving report to Excel.")
         attachment_path = save_report_to_excel(report_entries)
         logging.debug(f"Report saved to Excel at: {attachment_path}")
 
-        # Send email with the report and attachment
-        logging.debug("Sending email with the report and attachment.")
+        # Send email with the report and the plot attached
         send_email_with_report(html_report, attachment_path)
         logging.debug("Email sent successfully.")
 
@@ -1201,7 +1323,6 @@ def monitor_coins_and_send_report():
     else:
         logging.debug("No valid entries to report. DataFrame is empty.")
 
-        
 def normalize_score(raw_score, min_score, max_score, range=3):
     """
     Normalize a score to be between 0 and 3 and return the nearest integer.
@@ -1477,7 +1598,7 @@ def print_command_line_report(report_entries):
     None
     """
     df = pd.DataFrame(report_entries)
-    logging.debug("\nWeekly Report: Coin Analysis")
+    logging.debug("\nCoin Analysis Report")
     logging.debug(tabulate(df, headers="keys", tablefmt="grid"))
     logging.debug(f"\nReport generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -1505,7 +1626,7 @@ def print_command_line_report(report_entries, digest_summary):
 
     # Then logging.debug the table of analyzed coins
     df = pd.DataFrame(report_entries)
-    logging.debug("\nWeekly Report: Coin Analysis")
+    logging.debug("\nCoin Analysis Report")
     logging.debug(tabulate(df, headers="keys", tablefmt="grid"))
     logging.debug(f"\nReport generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -1526,7 +1647,7 @@ def gpt4o_analyze_and_recommend(df):
     prompt = f"""
     You are provided with detailed analysis data for several cryptocurrency coins. Using this data, provide a concise summary of which coins should be considered for purchase, along with the reasons for the recommendation. Only consider coins that have a potential of a breakout or a surge in value.
 
-    **Do not repeat or summarize the dataset.** Instead, return the recommendations in structured JSON format with each recommended coin and its reason for recommendation.
+    **Do not repeat or summarize the dataset.** Instead, return the recommendations in structured JSON format with each recommended coin and give a detailed reason for your recommendation based on the market data you have been given.
 
     Format your response as follows:
     {{
@@ -1535,7 +1656,7 @@ def gpt4o_analyze_and_recommend(df):
                 "coin": "Coin Name",
                 "liquidity_risk": "Low/Medium/High",
                 "cumulative_score": "Score Value",
-                "reason": "Concise reason for recommendation"
+                "reason": "A fluent and detailed reason for recommendation anchored in the data you have been provided."
             }},
             ...
         ]
@@ -1595,91 +1716,137 @@ def gpt4o_analyze_and_recommend(df):
         return {"recommendations": []}
 
 
-def generate_html_report_with_recommendations(report_entries, digest_summary, gpt_recommendations):
+def generate_html_report_with_recommendations(report_entries, digest_summary, gpt_recommendations, plot_image_path='top_coins_plot.png'):
     """
-    Generates an HTML report with summaries from the report entries and GPT-4o recommendations.
+    Generates an HTML report with summaries from the report entries, GPT-4o recommendations, and a plot of the top coins.
 
     Args:
         report_entries (list): List of report entries to include in the report.
         digest_summary (dict): Summary of the Sundown Digest to include at the top.
         gpt_recommendations (dict): GPT-4o's recommendations for coin purchases, structured as a list of dictionaries.
+        plot_image_path (str): Path to the plot image to embed in the report.
 
     Returns:
         str: HTML content of the report.
     """
-   
-    # Sundown Digest Summary section with improved inline styling
+    
+    # Sundown Digest Summary section
+    digest_items = ''.join(f'<li style="font-size:14px;line-height:1.6;">{item}</li>' for item in digest_summary['surge_summary'])
     digest_html = f"""
-    <div style="background-color:#f1f1f1; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-        <h3 style="color: #264653;">Sundown Digest Summary</h3>
-        <p><strong>Tickers:</strong> {', '.join(digest_summary['tickers'])}</p>
-        <p><strong>News Summary:</strong></p>
-        <ul style="padding-left: 20px;">
-            {''.join(f'<li>{item}</li>' for item in digest_summary['surge_summary'])}
-        </ul>
-    </div>
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#fff;">
+        <tr>
+            <td style="padding:20px;">
+                <h3 style="font-size:20px;color:#2a9d8f;margin-bottom:10px;">Sundown Digest Summary</h3>
+                <p style="font-size:14px;line-height:1.6;"><strong>Tickers Mentioned:</strong> {', '.join(digest_summary['tickers'])}</p>
+                <p style="font-size:14px;line-height:1.6;"><strong>News Summary:</strong></p>
+                <ul style="list-style-type:disc;padding-left:20px;margin:0;">
+                    {digest_items}
+                </ul>
+            </td>
+        </tr>
+    </table>
     """
 
-    print(gpt_recommendations['recommendations'])
-
+    # AI Recommendations Section
     if not gpt_recommendations['recommendations']:
         recommendations_html = """
-        <div style="background-color:#f9f9f9; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-            <h3 style="color: #e76f51;">AI Generated Coin Recommendations</h3>
-            <p>There are currently no coins recommended for purchase based on the analysis.</p>
-        </div>
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#fff;">
+            <tr>
+                <td style="padding:20px;">
+                    <h3 style="font-size:20px;color:#2a9d8f;margin-bottom:10px;">AI Generated Coin Recommendations</h3>
+                    <p style="font-size:14px;line-height:1.6;">No coins are currently recommended for purchase based on the analysis.</p>
+                </td>
+            </tr>
+        </table>
         """
     else:
+        recommendation_items = ''
+        for item in gpt_recommendations['recommendations']:
+            # Match the coin with report entries to fetch URL, cumulative score percentage
+            matching_entry = next((entry for entry in report_entries if entry["coin_name"].lower() == item["coin"].lower()), None)
+            
+            # CoinPaprika URL format or other URL source can be used here
+            coin_url = f"https://coinpaprika.com/coin/{matching_entry['coin_id']}/" if matching_entry else '#'
+            cumulative_score_percentage = matching_entry.get('cumulative_score_percentage', 'N/A')
+
+            # Capitalize each word in the coin name
+            coin_name = item["coin"].title()
+
+            recommendation_items += f"""
+            <li style="font-size:14px;line-height:1.6;margin-bottom:10px;">
+                <b>{coin_name}</b> - {item["reason"]}<br>
+                <strong>Cumulative Score Percentage:</strong> {cumulative_score_percentage}%<br>
+                <a href="{coin_url}" target="_blank" style="color:#0077cc;text-decoration:none;">More Info</a>
+            </li>
+            """
         recommendations_html = f"""
-        <div style="background-color:#f9f9f9; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-            <h3 style="color: #2a9d8f;">AI Generated Coin Recommendations</h3>
-            <ul style="padding-left: 20px;">
-                {''.join(f'<li><b>{item["coin"]}</b> - {item["reason"]}</li>' for item in gpt_recommendations['recommendations'])}
-            </ul>
-        </div>
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#fff;">
+            <tr>
+                <td style="padding:20px;">
+                    <h3 style="font-size:20px;color:#2a9d8f;margin-bottom:10px;">AI Generated Coin Recommendations</h3>
+                    <p style="font-size:14px;line-height:1.6;"><strong>Meaning of Cumulative Score Percentage:</strong> a higher percentage indicates a stronger potential based on historical data and analysis. </p>
+                    <ul style="list-style-type:disc;padding-left:20px;margin:0;">
+                        {recommendation_items}
+                    </ul>
+                </td>
+            </tr>
+        </table>
         """
 
+    # Embed the attached image in the HTML using CID
+    cid = "top_coins_plot"  # This should match the Content-ID of the attached image
+    plot_html = f"""
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#fff;">
+        <tr>
+            <td style="padding:20px;text-align:center;">
+                <h3 style="font-size:20px;color:#2a9d8f;margin-bottom:10px;">Top Coins Cumulative Scores Over Time</h3>
+                <img src="cid:{cid}" alt="Top Coins Plot" style="width:100%;max-width:600px;height:auto;"/>
+            </td>
+        </tr>
+    </table>
+    """
 
-    # Complete HTML content with summaries only
+    # Full HTML structure
     html_content = f"""
     <html>
-    <head>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background-color: #f9f9f9;
-                margin: 0;
-                padding: 20px;
-                color: #333;
-            }}
-            h2 {{
-                text-align: center;
-                color: #264653;
-                margin-bottom: 20px;
-            }}
-            h3 {{
-                color: #2a9d8f;
-            }}
-            ul {{
-                list-style: none;
-                padding-left: 0;
-            }}
-            li {{
-                margin-bottom: 10px;
-                font-size: 14px;
-            }}
-        </style>
-    </head>
-    <body>
-        <h2>Weekly Coin Analysis Report</h2>
-
-        {digest_html}
-        {recommendations_html}
-
-        <p style="text-align: center; color: #777;">Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <body style="margin:0;padding:0;background-color:#f9f9f9;font-family:Arial,sans-serif;color:#333;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f9f9f9;">
+            <tr>
+                <td align="center">
+                    <table width="600" cellpadding="0" cellspacing="0" border="0" style="background-color:#fff;">
+                        <tr>
+                            <td style="padding:20px;">
+                                <h2 style="text-align:center;color:#264653;font-size:24px;margin:0;">Coin Analysis Report</h2>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>
+                                {digest_html}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>
+                                {recommendations_html}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>
+                                {plot_html}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding:20px;">
+                                <p style="text-align:center;color:#777;font-size:12px;margin:0;">Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
     </body>
     </html>
     """
+
     return html_content
 
 
@@ -1764,15 +1931,102 @@ def save_report_to_excel(report_entries, filename='coin_analysis_report.xlsx'):
     return filename
 
 
-def send_email_with_report(html_content, attachment_path):
+def plot_top_coins_over_time(historical_data, top_n=5, file_name='top_coins_plot.png'):
     """
-    Sends an email with the given HTML content and attaches the Excel file.
+    Plots the cumulative scores of the top coins over time and saves the plot to a file.
+
+    Args:
+        historical_data (pd.DataFrame): DataFrame containing the historical data with 'coin_name', 'cumulative_score', and 'timestamp' columns.
+        top_n (int): The number of top coins to plot.
+        file_name (str): The name of the file to save the plot to.
+    """
+    # Avoid the SettingWithCopyWarning by using .loc
+    historical_data.loc[:, 'timestamp'] = pd.to_datetime(historical_data['timestamp'])
+
+    # Calculate the average cumulative score for each coin and select the top N coins
+    top_coins = historical_data.groupby('coin_name')['cumulative_score'].mean().nlargest(top_n).index
+
+    # Filter data for only the top coins
+    top_data = historical_data[historical_data['coin_name'].isin(top_coins)]
+
+    # Plot each top coin's cumulative score over time
+    plt.figure(figsize=(10, 6))
+    for coin in top_coins:
+        coin_data = top_data[top_data['coin_name'] == coin]
+        # Add markers to the plot (e.g., 'o' for circles)
+        plt.plot(coin_data['timestamp'], coin_data['cumulative_score'], label=coin, marker='o')
+
+    # Format x-axis with date formatting based on the range of dates in the data
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())  # Automatically adjust the date ticks
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))  # Format the ticks as 'Year-Month-Day'
+    
+    # Plot settings
+    plt.title(f'Top {top_n} Coins by Cumulative Score Over Time')
+    plt.xlabel('Date')
+    plt.ylabel('Cumulative Score')
+    plt.legend()
+
+    # Save plot to file
+    plt.tight_layout()
+    plt.savefig(file_name)
+    #plt.show()
+
+
+def retrieve_historical_data_from_aurora():
+    """
+    Retrieves historical cumulative scores from Amazon Aurora for all coins.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing the timestamp, coin name, and cumulative score.
+    """
+    engine = None
+    try:
+        # Build the database connection string
+        db_connection_str = (
+            f"postgresql://{os.getenv('AURORA_USER')}:{os.getenv('AURORA_PASSWORD')}"
+            f"@{os.getenv('AURORA_HOST')}:{os.getenv('AURORA_PORT', 5432)}/{os.getenv('AURORA_DB')}"
+        )
+
+        # Create an SQLAlchemy engine
+        engine = create_engine(db_connection_str)
+
+        # Define the SQL query to retrieve time series data
+        query = """
+            SELECT coin_name, cumulative_score, timestamp 
+            FROM coin_data
+            ORDER BY timestamp;
+        """
+        
+        # Use pandas to execute the query and return the result as a DataFrame
+        df = pd.read_sql(query, engine)
+        print("Historical data retrieved successfully.")
+        return df
+
+    except SQLAlchemyError as e:
+        print(f"Error retrieving historical data: {e}")
+        return pd.DataFrame()  # Return empty DataFrame on failure
+
+    finally:
+        if engine:
+            engine.dispose()  # Close the connection
+            print("PostgreSQL connection is closed.")
+
+def send_email_with_report(html_content, attachment_path, plot_image_path='top_coins_plot.png'):
+    """
+    Sends an email with an HTML report and an attached image.
+
+    The email uses a 'related' MIME type to allow both HTML and images to be attached.
+    The HTML content is passed as a string and the image is attached as an inline
+    attachment with a Content-ID header that matches the CID in the HTML content.
 
     Args:
         html_content (str): The HTML content of the email.
-        attachment_path (str): Path to the Excel file to attach.
+        attachment_path (str): The path to the image file to attach.
+
+    Returns:
+        None
     """
-    msg = MIMEMultipart('alternative')
+    msg = MIMEMultipart('related')  # 'related' allows attaching both HTML and images
     msg['Subject'] = "AI Generated Coin Analysis Report"
     msg['From'] = EMAIL_FROM
     msg['To'] = EMAIL_TO
@@ -1781,11 +2035,13 @@ def send_email_with_report(html_content, attachment_path):
     part = MIMEText(html_content, 'html')
     msg.attach(part)
 
-    # Attach Excel file
-    with open(attachment_path, "rb") as file:
-        attachment = MIMEText(file.read(), 'base64', 'utf-8')
-        attachment.add_header('Content-Disposition', 'attachment', filename=os.path.basename(attachment_path))
-        msg.attach(attachment)
+    # Attach the image (inline attachment with Content-ID)
+    with open(plot_image_path, 'rb') as img_file:
+        mime_image = MIMEImage(img_file.read(), _subtype='.png')
+        mime_image.add_header('Content-ID', '<top_coins_plot>')  # Content-ID should match CID in HTML
+         # Set Content-Disposition with a filename
+        mime_image.add_header('Content-Disposition', 'inline', filename="top_coins_plot.png")
+        msg.attach(mime_image)
 
     # Send the email
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
